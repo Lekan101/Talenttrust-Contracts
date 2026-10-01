@@ -15,6 +15,10 @@
 //!
 //! 1. `propose_admin(new)` — current admin stores `new` under `PendingAdmin`
 //!    with the current ledger sequence. Self-proposals are rejected.
+//!    If a previous proposal is still active (within TTL), proposing again
+//!    overwrites it and emits a `replaced` event so the superseded proposal
+//!    is observable.  If the previous proposal is already expired, it is
+//!    silently replaced (it was already unacceptable).
 //! 2. `accept_admin()` — the *proposed* address, not the current admin,
 //!    authorizes this call. It must arrive no earlier than
 //!    `ADMIN_ROTATION_MIN_DELAY_LEDGERS` after the proposal (the reaction
@@ -23,10 +27,71 @@
 //!    circumstances that produced it have changed).
 //! 3. `cancel_admin()` — the current admin can abort a pending proposal at any
 //!    time, expired or not.
+//! 4. `recover_admin_proposal()` — the current admin can clean up an expired
+//!    proposal after `ADMIN_ROTATION_PROPOSAL_TTL_LEDGERS` ledgers have elapsed.
+//!    This is the deterministic recovery path after an `accept_admin` call fails
+//!    with `AdminProposalExpired`.
+//!
+//! ## Failure recovery model
+//!
+//! Soroban panics roll back all storage writes atomically, so no partial state
+//! can be persisted.  The following table documents each failure path and its
+//! deterministic recovery:
+//!
+//! | Failure                       | Cause                                      | Recovery                                    |
+//! |-------------------------------|--------------------------------------------|---------------------------------------------|
+//! | `TimelockNotElapsed`          | `accept_admin` before min-delay ledgers    | Wait; retry `accept_admin` later            |
+//! | `AdminProposalExpired`        | `accept_admin` after TTL ledgers           | Admin calls `recover_admin_proposal` then re-proposes |
+//! | `InvalidState` (accept)       | `accept_admin` with no pending proposal    | Admin calls `propose_admin` first           |
+//! | `InvalidState` (cancel)       | `cancel_admin` with no pending proposal    | No-op; nothing to cancel                    |
+//! | `CannotProposeSelf`           | `propose_admin` with current admin address | Use a different address                     |
+//! | `NotInitialized`              | Any call before `initialize`               | Call `initialize` first                     |
 //!
 //! Every transition clears or overwrites `PendingAdmin` so an accept can never
 //! be replayed against a cancelled or already-consumed proposal: it simply
 //! finds nothing pending and fails with `Error::InvalidState`.
+//!
+//! ## Compatibility contract
+//!
+//! The behavior below is observable by deployed clients, indexers, and
+//! operators. Every change to this module must preserve it, or ship an
+//! explicit, tested migration plan. `test::governance_compatibility` pins
+//! each item.
+//!
+//! * **Frozen entrypoint surface.** Public names, parameter order/types, and
+//!   return types (`setters -> bool`, `getters -> total functions`) must not
+//!   change without a client migration.
+//! * **Total readers on empty data.** No getter here calls
+//!   [`Escrow::require_initialized`]: before `initialize`, on a fresh
+//!   contract, or after an upgrade that left a key unset, they return the
+//!   documented defaults instead of failing — fee bps `0`, max milestones
+//!   `crate::MAX_MILESTONES`, withdrawal cap `5_000` bps, cooldown `17_280`
+//!   ledgers, last withdrawal ledger `0`, governed parameters `None`,
+//!   pending admin `None`. The numeric defaults live once and only once in
+//!   the constants below.
+//! * **Failure atomicity.** Validation runs before any write, and every
+//!   rejection is a typed panic, which rolls the whole call back — including
+//!   the admin-nonce burn in [`Escrow::set_protocol_fee_bps`] and any event
+//!   already queued. A rejected call therefore persists nothing, burns no
+//!   nonce, and emits no event, making retries and concurrent replays safe.
+//! * **Event topics and payload arity.** See the `# Events` sections on each
+//!   setter. The governance-proposal apply path
+//!   ([`crate::governance_proposal`]) reuses the `protocol_fee_bps`,
+//!   `governed_parameters`, `fee_cap`, and `fee_cooldown` topics with a
+//!   3-field payload (no `admin`) while the direct setters here emit 4-field
+//!   payloads; indexers branch on that arity. Neither shape may change
+//!   casually.
+//! * **Storage keys are the wire format.** Values must remain decodable
+//!   under their `DataKey` variant (`ProtocolFeeBps`/`MaxMilestones`/u32,
+//!   `GovernedParameters`/struct, `PendingAdmin`/struct, fee-rate-limit
+//!   keys/u32, `Admin`/Address). Reusing a key for a different shape is a
+//!   breaking change requiring migration.
+//! * **Authorization invariants.** Every setter requires an initialized
+//!   contract (`Error::NotInitialized`) and the stored `DataKey::Admin` to
+//!   authorize; [`Escrow::set_governed_parameters`] additionally rejects a
+//!   mismatched `admin` argument with `Error::UnauthorizedRole`; admin
+//!   transfer is propose/accept/cancel with the timelock window enforced on
+//!   accept only.
 
 use crate::storage_validation;
 use crate::ttl;
@@ -37,6 +102,32 @@ use crate::{
 };
 use soroban_sdk::{contractimpl, symbol_short, Address, Env, Symbol};
 
+// ── Compatibility constants ─────────────────────────────────────────────────
+//
+// Defaults and bounds that are part of the module's observable behavior.
+// Getters fall back to the `DEFAULT_*` values when their `DataKey` entry is
+// unset, and setters reject anything above the `MAX_*` values. Changing a
+// number here changes public behavior for every existing caller and indexer;
+// `test::governance_compatibility` pins each value.
+
+/// Fallback for `DataKey::ProtocolFeeBps` when unset: no protocol fee.
+pub(crate) const DEFAULT_PROTOCOL_FEE_BPS: u32 = 0;
+
+/// Fallback for `DataKey::FeeWithdrawalCap` when the key is unset: 50 %.
+pub(crate) const DEFAULT_FEE_WITHDRAWAL_CAP_BPS: u32 = 5_000;
+
+/// Upper bound for the fee-withdrawal cap: 100 % of accumulated fees, i.e.
+/// the same basis-point ceiling as [`MAX_FEE_BPS`].
+pub(crate) const MAX_FEE_WITHDRAWAL_CAP_BPS: u32 = MAX_FEE_BPS;
+
+/// Fallback for `DataKey::FeeWithdrawalCooldownLedgers` when the key is
+/// unset: ≈1 day at 5 s ledgers.
+pub(crate) const DEFAULT_FEE_WITHDRAWAL_COOLDOWN_LEDGERS: u32 = 17_280;
+
+/// Upper bound for the fee-withdrawal cooldown: ≈150 days at 5 s ledgers.
+/// Larger values are rejected so a typo cannot permanently lock the treasury.
+pub(crate) const MAX_FEE_WITHDRAWAL_COOLDOWN_LEDGERS: u32 = 2_592_000;
+
 #[contractimpl]
 impl Escrow {
     /// Set the protocol fee in basis points.
@@ -44,11 +135,20 @@ impl Escrow {
     /// Admin-gated: the stored admin (under [`DataKey::Admin`]) must authorize
     /// the call and the contract must be initialized.
     ///
-    /// **Two-step requirement**: a governance proposal of kind
-    /// `GovernanceProposalKind::SetProtocolFeeBps(new_bps)` must have been
-    /// requested via `request_governance_proposal` and approved via
-    /// `approve_governance_proposal` before this setter can be called.  Pass
-    /// the approved proposal ID as `approved_proposal_id`.
+    /// **Two-step alternative**: the same change can be routed through a
+    /// governance proposal of kind
+    /// `GovernanceProposalKind::SetProtocolFeeBps(new_bps)` via
+    /// `request_governance_proposal` → `approve_governance_proposal` →
+    /// `apply_governance_proposal`. This direct setter remains the legacy
+    /// single-step admin path — it does not itself require an approved
+    /// proposal, and callers depend on that; prefer the proposal flow for
+    /// high-impact changes.
+    ///
+    /// **Admin nonce (replay protection)**: `admin_nonce` must equal the
+    /// stored `DataKey::AdminNonce` plus one (the first call after
+    /// `initialize` uses `1`). A mismatch panics with [`Error::StaleNonce`];
+    /// because a panicking call rolls back completely, a rejected attempt
+    /// never burns the nonce.
     ///
     /// `new_bps` must be `≤ 10_000` (100%). The fee takes effect immediately for
     /// the next `release_milestone` call.
@@ -68,8 +168,13 @@ impl Escrow {
         admin.require_auth();
         crate::storage::consume_admin_nonce(&env, admin_nonce);
 
+        // Invariant: the protocol fee must never exceed 100% (10_000 bps).
+        // Validate before any state mutation so a rejected call cannot leave
+        // a partially-updated configuration behind.
         storage_validation::validate_protocol_fee_bps(&env, new_bps);
-        if new_bps > 10_000 {
+        // Redundant with `validate_protocol_fee_bps` but kept as an explicit
+        // second guard: the stored value must never exceed 100 %.
+        if new_bps > MAX_FEE_BPS {
             env.panic_with_error(Error::InvalidProtocolParameters);
         }
 
@@ -77,7 +182,7 @@ impl Escrow {
             .storage()
             .persistent()
             .get(&DataKey::ProtocolFeeBps)
-            .unwrap_or(0u32);
+            .unwrap_or(DEFAULT_PROTOCOL_FEE_BPS);
         env.storage()
             .persistent()
             .set(&DataKey::ProtocolFeeBps, &new_bps);
@@ -90,11 +195,14 @@ impl Escrow {
     }
 
     /// Returns the current protocol fee in basis points.
+    ///
+    /// Total function: returns the stored value or the compatibility default
+    /// [`DEFAULT_PROTOCOL_FEE_BPS`] when the key is unset (never fails).
     pub fn get_protocol_fee_bps(env: Env) -> u32 {
         env.storage()
             .persistent()
             .get::<_, u32>(&DataKey::ProtocolFeeBps)
-            .unwrap_or(0)
+            .unwrap_or(DEFAULT_PROTOCOL_FEE_BPS)
     }
 
     /// Set the maximum allowed milestones per contract (admin-controlled).
@@ -103,9 +211,14 @@ impl Escrow {
     /// `max_milestones` is validated against compile-time safe bounds and a
     /// typed `LimitOutOfRange` error is returned for invalid values.
     ///
-    /// **Two-step requirement**: a governance proposal of kind
-    /// `GovernanceProposalKind::SetMaxMilestones(max_milestones)` must have been
-    /// requested and approved before this setter can be called.
+    /// `max_milestones` must be within `[MIN_MAX_MILESTONES, MAX_MAX_MILESTONES]`.
+    ///
+    /// **Two-step alternative**: a governance proposal of kind
+    /// `GovernanceProposalKind::SetMaxMilestones(max_milestones)` can be routed
+    /// through `request_governance_proposal` → `approve_governance_proposal` →
+    /// `apply_governance_proposal`. This direct setter is the legacy
+    /// single-step admin path and does not itself require an approved
+    /// proposal; that behavior is preserved for existing callers.
     pub fn set_max_milestones(env: Env, max_milestones: u32) -> bool {
         Self::require_initialized(&env);
         let admin: Address = env
@@ -115,6 +228,9 @@ impl Escrow {
             .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
         admin.require_auth();
 
+        // Invariant: the configured milestone cap must stay within the
+        // compile-time safe bounds. Reject out-of-range values before writing
+        // so the stored configuration is never left in an invalid state.
         if max_milestones < MIN_MAX_MILESTONES || max_milestones > MAX_MAX_MILESTONES {
             env.panic_with_error(Error::LimitOutOfRange);
         }
@@ -152,8 +268,22 @@ impl Escrow {
     /// * [`Error::NotInitialized`] — `initialize` has not been called.
     /// * [`Error::CannotProposeSelf`] — `proposed` is the current admin.
     ///
+    /// # Concurrent re-proposal behaviour
+    ///
+    /// If a previous proposal is still active (within `ADMIN_ROTATION_PROPOSAL_TTL_LEDGERS`),
+    /// the new proposal **overwrites** it and an additional
+    /// `(symbol_short!("admin"), Symbol("replaced"))` → `(admin, superseded, timestamp)`
+    /// event is emitted before the normal `proposed` event.  This makes it
+    /// explicit to off-chain observers that the prior candidate was displaced,
+    /// which is the critical signal for any system that monitors pending
+    /// transfers.  An expired proposal is silently replaced — it was already
+    /// unreachable — so no `replaced` event is emitted in that case.
+    ///
     /// # Events
     /// `(symbol_short!("admin"), Symbol("proposed"))` → `(admin, proposed, timestamp)`
+    ///
+    /// Additional event when overwriting a live proposal:
+    /// `(symbol_short!("admin"), Symbol("replaced"))` → `(admin, superseded_proposed, timestamp)`
     pub(crate) fn propose_admin_impl(env: &Env, proposed: Address) -> bool {
         Self::require_initialized(env);
 
@@ -164,8 +294,36 @@ impl Escrow {
             .unwrap_or_else(|| env.panic_with_error(Error::ContractNotFound));
         admin.require_auth();
 
+        // Invariant: a self-proposal is a no-op that would let the current
+        // admin bypass the reaction window, so reject it before touching
+        // PendingAdmin.
         if proposed == admin {
             env.panic_with_error(Error::CannotProposeSelf);
+        }
+
+        // If a previous proposal exists and is still within its acceptance
+        // window, emit a `replaced` event so the superseded candidate address
+        // is observable off-chain.  This makes re-proposals non-silently
+        // deterministic: monitoring tools and the displaced candidate can
+        // detect that their window has been closed.
+        if let Some(existing) =
+            env.storage()
+                .persistent()
+                .get::<_, PendingAdminProposal>(&DataKey::PendingAdmin)
+        {
+            let elapsed = env
+                .ledger()
+                .sequence()
+                .saturating_sub(existing.proposed_at_ledger);
+            // Only emit `replaced` for proposals still within their TTL
+            // (i.e. ones that *could* have been accepted).  Expired proposals
+            // are silently overwritten because they were already unreachable.
+            if elapsed <= ADMIN_ROTATION_PROPOSAL_TTL_LEDGERS {
+                env.events().publish(
+                    (symbol_short!("admin"), Symbol::new(env, "replaced")),
+                    (admin.clone(), existing.proposed, env.ledger().timestamp()),
+                );
+            }
         }
 
         env.storage().persistent().set(
@@ -200,12 +358,17 @@ impl Escrow {
     /// * [`Error::InvalidState`] — there is no pending proposal.
     /// * [`Error::TimelockNotElapsed`] — called before
     ///   `ADMIN_ROTATION_MIN_DELAY_LEDGERS` ledgers have elapsed since the
-    ///   proposal.
+    ///   proposal. Retry after more ledgers have closed.
     /// * [`Error::AdminProposalExpired`] — called after
     ///   `ADMIN_ROTATION_PROPOSAL_TTL_LEDGERS` ledgers have elapsed since the
-    ///   proposal. The stale proposal is left in place (a panic rolls back
-    ///   any state change, so there is nothing to clear here) — call
-    ///   [`Escrow::cancel_admin`] or `propose_admin` again to replace it.
+    ///   proposal. The stale proposal **cannot be cleared inside this call**
+    ///   because Soroban panics roll back all storage writes atomically; the
+    ///   panicking accept cannot both fail and persist a removal.  The
+    ///   deterministic recovery path is:
+    ///   1. The current admin calls [`Escrow::recover_admin_proposal`] to
+    ///      remove the expired record.
+    ///   2. The admin then calls [`Escrow::propose_admin`] with the new
+    ///      address to start a fresh rotation.
     ///
     /// # Events
     /// `(symbol_short!("admin"), Symbol("accepted"))` → `(old_admin, new_admin, timestamp)`
@@ -218,6 +381,9 @@ impl Escrow {
             .get(&DataKey::PendingAdmin)
             .unwrap_or_else(|| env.panic_with_error(Error::InvalidState));
 
+        // Invariant: acceptance is only valid inside the [min_delay, ttl]
+        // window. Both bounds are checked before authorization and before any
+        // state mutation, so a rejected accept cannot consume the proposal.
         let elapsed = env
             .ledger()
             .sequence()
@@ -226,9 +392,17 @@ impl Escrow {
             env.panic_with_error(Error::TimelockNotElapsed);
         }
         if elapsed > ADMIN_ROTATION_PROPOSAL_TTL_LEDGERS {
+            // The proposal has expired.  Soroban panics roll back all storage
+            // writes atomically, so we cannot clear `PendingAdmin` here while
+            // simultaneously panicking — the removal would be rolled back.
+            // The admin must call `recover_admin_proposal` followed by a fresh
+            // `propose_admin` to regain a clean rotation state.
             env.panic_with_error(Error::AdminProposalExpired);
         }
 
+        // Invariant: only the proposed address may accept, and it must
+        // authorize this call. The proposal is consumed atomically below so a
+        // replay finds nothing pending and fails with InvalidState.
         let pending_admin = pending.proposed;
         pending_admin.require_auth();
 
@@ -238,6 +412,9 @@ impl Escrow {
             .get(&DataKey::Admin)
             .unwrap_or_else(|| env.panic_with_error(Error::ContractNotFound));
 
+        // Invariant: the admin slot is overwritten and the pending proposal is
+        // cleared in the same transaction, so there is never a window where
+        // both the old and new admin are simultaneously authorized.
         env.storage()
             .persistent()
             .set(&DataKey::Admin, &pending_admin);
@@ -285,6 +462,9 @@ impl Escrow {
             .unwrap_or_else(|| env.panic_with_error(Error::ContractNotFound));
         admin.require_auth();
 
+        // Invariant: cancellation requires a live proposal and is authorized
+        // by the current admin only. Removing it here guarantees a subsequent
+        // accept_admin call fails with InvalidState (no replay).
         let pending: PendingAdminProposal = env
             .storage()
             .persistent()
@@ -378,10 +558,13 @@ impl Escrow {
     /// Sets `protocol_fee_bps` (must be `≤ 10_000`) and `max_escrow_total_stroops`
     /// atomically. Also flips `ReadinessChecklist::governed_params_set` to `true`.
     ///
-    /// **Two-step requirement**: a governance proposal of kind
-    /// `GovernanceProposalKind::SetGovernedParams(params)` must have been
-    /// requested and approved before this setter can be called.
-    /// Pass the approved proposal ID as `approved_proposal_id`.
+    /// **Two-step alternative**: the same change can be routed through a
+    /// governance proposal of kind
+    /// `GovernanceProposalKind::SetGovernedParams(params)` via
+    /// `request_governance_proposal` → `approve_governance_proposal` →
+    /// `apply_governance_proposal`. This direct setter is the legacy
+    /// single-step admin path and does not itself require an approved
+    /// proposal; that behavior is preserved for existing callers.
     ///
     /// See [`docs/escrow/protocol-fees.md`](../../../docs/escrow/protocol-fees.md) for
     /// the full basis-point model and fee lifecycle.
@@ -407,9 +590,11 @@ impl Escrow {
     /// enforces admin authorization, records old and new parameters in an event,
     /// and marks the readiness checklist.
     ///
-    /// **Two-step requirement**: a governance proposal of kind
-    /// `GovernanceProposalKind::SetGovernedParams(new_parameters)` must have been
-    /// requested and approved before this setter can be called.
+    /// **Two-step alternative**: as with [`Escrow::set_governed_params`], the
+    /// reviewed path is a `GovernanceProposalKind::SetGovernedParams` proposal
+    /// applied via `apply_governance_proposal`; this direct setter remains the
+    /// legacy single-step admin path and keeps that behavior for compatibility
+    /// (it does not verify an approved proposal).
     ///
     /// # Events
     /// `(Symbol("governed_parameters"),)` → `(old_parameters, new_parameters, admin, timestamp)`
@@ -476,6 +661,10 @@ impl Escrow {
     }
 
     /// Retrieve the current governed parameters with persistent TTL renewal.
+    ///
+    /// Total function on empty data: returns `None` (never fails) when no
+    /// parameters have been stored, keeping pre-configuration reads safe for
+    /// indexers and post-upgrade readers alike.
     pub fn get_governed_parameters(env: Env) -> Option<GovernedParameters> {
         let params: Option<GovernedParameters> =
             env.storage().persistent().get(&DataKey::GovernedParameters);
@@ -492,9 +681,11 @@ impl Escrow {
     ///
     /// Admin-gated, must be initialized.  A value of `0` disables the cap
     /// (unlimited withdrawals, subject to the cooldown).  Values above
-    /// `10_000` (100 %) are rejected with [`Error::InvalidProtocolParameters`].
+    /// [`MAX_FEE_WITHDRAWAL_CAP_BPS`] (100 %) are rejected with
+    /// [`Error::InvalidProtocolParameters`].
     ///
-    /// Stored under [`DataKey::FeeWithdrawalCap`].  Default is `5_000` (50 %).
+    /// Stored under [`DataKey::FeeWithdrawalCap`].  Default is
+    /// [`DEFAULT_FEE_WITHDRAWAL_CAP_BPS`] (50 %).
     ///
     /// # Events
     /// `(Symbol("fee_cap"),)` → `(old_cap, new_cap, admin, timestamp)`
@@ -507,7 +698,7 @@ impl Escrow {
             .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
         admin.require_auth();
 
-        if cap_bps > 10_000 {
+        if cap_bps > MAX_FEE_WITHDRAWAL_CAP_BPS {
             env.panic_with_error(Error::InvalidProtocolParameters);
         }
 
@@ -515,7 +706,7 @@ impl Escrow {
             .storage()
             .persistent()
             .get(&DataKey::FeeWithdrawalCap)
-            .unwrap_or(5_000u32);
+            .unwrap_or(DEFAULT_FEE_WITHDRAWAL_CAP_BPS);
 
         env.storage()
             .persistent()
@@ -530,13 +721,14 @@ impl Escrow {
 
     /// Return the current fee-withdrawal cap in basis points.
     ///
-    /// Returns the stored value, or the default of `5_000` (50 %) when
-    /// no value has been explicitly set.
+    /// Returns the stored value, or the compatibility default
+    /// [`DEFAULT_FEE_WITHDRAWAL_CAP_BPS`] (50 %) when no value has been
+    /// explicitly set.
     pub fn get_fee_withdrawal_cap(env: Env) -> u32 {
         env.storage()
             .persistent()
             .get(&DataKey::FeeWithdrawalCap)
-            .unwrap_or(5_000u32)
+            .unwrap_or(DEFAULT_FEE_WITHDRAWAL_CAP_BPS)
     }
 
     /// Set the minimum number of ledgers that must elapse between successful
@@ -544,11 +736,12 @@ impl Escrow {
     ///
     /// Admin-gated, must be initialized.  A value of `0` disables the cooldown
     /// (unlimited frequency, subject to the cap).  Values above
-    /// `2_592_000` (≈150 days at 5 s ledgers) are rejected with
-    /// [`Error::InvalidProtocolParameters`].
+    /// [`MAX_FEE_WITHDRAWAL_COOLDOWN_LEDGERS`] (≈150 days at 5 s ledgers) are
+    /// rejected with [`Error::InvalidProtocolParameters`].
     ///
     /// Stored under [`DataKey::FeeWithdrawalCooldownLedgers`].
-    /// Default is `17_280` (≈1 day at 5 s ledgers).
+    /// Default is [`DEFAULT_FEE_WITHDRAWAL_COOLDOWN_LEDGERS`] (≈1 day at
+    /// 5 s ledgers).
     ///
     /// # Events
     /// `(Symbol("fee_cooldown"),)` → `(old_cooldown, new_cooldown, admin, timestamp)`
@@ -562,7 +755,7 @@ impl Escrow {
         admin.require_auth();
 
         // Cap at ~150 days to prevent accidental permanent lockout.
-        if cooldown_ledgers > 2_592_000 {
+        if cooldown_ledgers > MAX_FEE_WITHDRAWAL_COOLDOWN_LEDGERS {
             env.panic_with_error(Error::InvalidProtocolParameters);
         }
 
@@ -570,7 +763,7 @@ impl Escrow {
             .storage()
             .persistent()
             .get(&DataKey::FeeWithdrawalCooldownLedgers)
-            .unwrap_or(17_280u32);
+            .unwrap_or(DEFAULT_FEE_WITHDRAWAL_COOLDOWN_LEDGERS);
 
         env.storage()
             .persistent()
@@ -590,13 +783,14 @@ impl Escrow {
 
     /// Return the current fee-withdrawal cooldown in ledgers.
     ///
-    /// Returns the stored value, or the default of `17_280` (≈1 day at
-    /// 5 s ledgers) when no value has been explicitly set.
+    /// Returns the stored value, or the compatibility default
+    /// [`DEFAULT_FEE_WITHDRAWAL_COOLDOWN_LEDGERS`] (≈1 day at 5 s ledgers)
+    /// when no value has been explicitly set.
     pub fn get_fee_withdrawal_cooldown(env: Env) -> u32 {
         env.storage()
             .persistent()
             .get(&DataKey::FeeWithdrawalCooldownLedgers)
-            .unwrap_or(17_280u32)
+            .unwrap_or(DEFAULT_FEE_WITHDRAWAL_COOLDOWN_LEDGERS)
     }
 
     /// Return the ledger sequence of the last successful protocol-fee
